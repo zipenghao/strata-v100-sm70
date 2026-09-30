@@ -1,5 +1,7 @@
 # 诊断开关：verify 窗口的 logits / 残差 / 逐层快照 / PLE 中间量转储（env 触发，默认惰性），以及单 token prompt 可进入验证窗口
 # 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+# 上游：Strata v0.1.24（MIT, Copyright (c) 2026 Niko1221 and the Strata contributors）
+# 本补丁为第三方修改产物，以 MIT 许可分发；本仓库非 Strata 官方发布物。
 --- a/src/core/verify.cpp
 +++ b/src/core/verify.cpp
 @@ -318,6 +318,29 @@

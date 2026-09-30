@@ -1,5 +1,7 @@
 # 双卡优化：修正分卡时 prompt 路径借用/预留的两处不一致、限回 chunk=2048、并把 8GiB 竞技场钉住上限从 Windows-only 改为 Linux 靠 memlock
 # 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+# 上游：Strata v0.1.24（MIT, Copyright (c) 2026 Niko1221 and the Strata contributors）
+# 本补丁为第三方修改产物，以 MIT 许可分发；本仓库非 Strata 官方发布物。
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -1139,7 +1150,18 @@

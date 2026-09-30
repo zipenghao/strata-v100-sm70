@@ -1,5 +1,7 @@
 # 正确性修复：ple_conv1d.weight 在该 GGUF 中是 F32，按 fp16 位强转会使 PLE 卷积输出放大约 500 倍，从第 1 层起污染残差，输出为乱码
 # 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+# 上游：Strata v0.1.24（MIT, Copyright (c) 2026 Niko1221 and the Strata contributors）
+# 本补丁为第三方修改产物，以 MIT 许可分发；本仓库非 Strata 官方发布物。
 --- a/src/program/generate.cpp
 +++ b/src/program/generate.cpp
 @@ -26,6 +26,7 @@
