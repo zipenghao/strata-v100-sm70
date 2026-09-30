@@ -1,0 +1,95 @@
+# 双卡优化：修正分卡时 prompt 路径借用/预留的两处不一致、限回 chunk=2048、并把 8GiB 竞技场钉住上限从 Windows-only 改为 Linux 靠 memlock
+# 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1139,7 +1150,18 @@
+             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
+             return 2;
+         }
+-        o.no_prefill_borrow = true;   // each stage's prompt path has its own buffers
++        // Local patch: upstream forces the prompt path to own its buffers under a layer split, which also
++        // drops the chunk to 2048 (see the prefill_auto rule below).  Measured on 2x V100 sm_70: the split then
++        // reads a 4053-token prompt at 406 tok/s against 783 tok/s on one card, and the engine's own log says
++        // why - "the prompt path allocates its own buffers (too few cache slots to borrow)" instead of the
++        // single card's "borrows 2335 cache slots (4.31 GiB)".  Each stage has its OWN expert cache, so a
++        // borrow inside one stage cannot collide with the other; set STRATA_SPLIT_NO_BORROW=1 for the
++        // upstream behaviour.
++        if (std::getenv("STRATA_SPLIT_NO_BORROW") == nullptr) {
++            std::fprintf(stderr, "strata generate: layer split: the prompt path may borrow cache slots per stage\n");
++        } else {
++            o.no_prefill_borrow = true;   // each stage's prompt path has its own buffers
++        }
+         int n_vis = 1;
+         if (cudaGetDeviceCount(&n_vis) != cudaSuccess || n_vis < 1) n_vis = 1;
+         cudaGetLastError();
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1160,8 +1182,12 @@
+         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
+                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
+     }
+-    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
+-        o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
++    // Local patch: a layer split's LATER stages allocate their own prompt buffers, so the chunk must stay small
++    // enough for them even when the first stage borrows - 8192 tokens needs 5600 MiB per later stage and the
++    // engine then refuses to start ("device buffers for a chunk of 8192 tokens do not fit").  Borrowing itself
++    // is left enabled; only the chunk is capped, which is what the auto rule already does without a profile.
++    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty() || multi_gpu)) {
++        o.prefill_auto = false;       // nothing to lend from, or a later stage must fit its own: keep them small
+         o.prefill_chunk = 2048;
+     }
+     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1758,7 +1828,17 @@
+         // Unregistered layers remain in the resident arena and use the CPU expert path.
+         // (a layer split across GPUs too: pinning all of it into two contexts leaves WDDM refusing every later
+         // allocation - measured on the 5080 + 3090 rig: cudaMemGetInfo and the next cudaMalloc fail)
+-        const uint64_t pin_limit = (o.expert_cache_remote[0] > 0 || multi_gpu) ? (8ull << 30) : 0;
++        // Local patch: the 8 GiB cap above is a WDDM workaround, and the comment says so - on Linux the only
++        // constraint is RLIMIT_MEMLOCK, which /etc/security/limits.d/99-strata.conf raises to unlimited.  With
++        // the cap, the SECOND context pins 7 of 45.29 GiB and streams its misses through pageable memory instead
++        // of DMA, which is where the split lost half of its prompt throughput.  STRATA_ARENA_PIN_CAP=<GiB>
++        // restores the old cap for an A/B run.  A whole-arena failure is not fatal: the arena falls back to
++        // slice-by-slice pinning plus STRATA_ARENA_LOCK and says so in the note.
++        uint64_t pin_limit = 0;
++        if (const char* cap = std::getenv("STRATA_ARENA_PIN_CAP")) pin_limit = std::strtoull(cap, nullptr, 10) << 30;
++#if defined(_WIN32)
++        if (pin_limit == 0 && (o.expert_cache_remote[0] > 0 || multi_gpu)) pin_limit = 8ull << 30;
++#endif
+         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit)) {
+             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+             return 1;
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1818,6 +1898,12 @@
+     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
+     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
+     // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
++    // Local patch: this must agree with the CUDA0 sizing further down (`borrow ? 0 : ...`).  When the prompt
++    // path borrows the cache for its buffers there is NO dedicated VRAM to reserve, so reserving chunk*680 here
++    // starved the later stage: measured on 2x V100 sm_70, CUDA1 fell from ~3461 to 1290 slots and decode went
++    // 33 -> 27.7 tok/s, purely from this reservation.  Upstream never sees the mismatch because a layer split
++    // also forces no_prefill_borrow, which makes both computations agree.
++    const bool split_borrows = !o.no_prefill_borrow && !o.expert_profile.empty();
+     const int64_t split_pf_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+     auto stage_room = [&](int dev, bool later) -> int64_t {
+         const strata::core::OnDevice on(dev);
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1825,7 +1911,14 @@
+         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
+             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
+                          cudaGetErrorString(e));
+-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? 1024 : 0)) << 20;
++        // Local patch: only the FIRST stage's prompt path borrows cache slots for its buffers; every later
++        // stage still allocates its own device buffers (the engine says so at start-up and refuses the chunk
++        // if they do not fit).  So the reservation belongs to the later stages alone when borrowing is on, and
++        // to both when it is off.  Reserving it everywhere starved CUDA1 (1290 of ~3461 slots, decode
++        // 33 -> 27.7 tok/s); reserving it nowhere made CUDA1 fail with "device buffers for a chunk of 8192
++        // tokens do not fit".  This is the per-stage version of the same rule the CUDA0 sizing uses.
++        const int64_t pf_reserve = split_borrows ? (later ? split_pf_mib : 0) : split_pf_mib;
++        const int64_t reserve = ((int64_t) o.vram_reserve_mib + pf_reserve + (later ? 1024 : 0)) << 20;
+         return std::max<int64_t>((int64_t) fb - reserve, 0);
+     };
+     if (multi_gpu && split_auto) {

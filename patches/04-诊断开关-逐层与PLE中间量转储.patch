@@ -1,0 +1,196 @@
+# 诊断开关：verify 窗口的 logits / 残差 / 逐层快照 / PLE 中间量转储（env 触发，默认惰性），以及单 token prompt 可进入验证窗口
+# 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -318,6 +318,29 @@
+ // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
+ // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
+ // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
++// Local patch (see STRATA_DUMP_LAYERS2 in record_window): the pinned per-layer snapshot, written here so
++// run()'s dump block can hand it to the host.
++// Local patch (STRATA_DUMP_PLE): a device staging buffer for the PLE block's intermediates.  The copy
++// inside the capture must land in DEVICE memory; the host read happens in run() after the sync.
++static float* g_ple = nullptr;
++static int64_t g_ple_n = 0;
++static const int64_t kPleDumpFloats = 5 * 10240 + 2560 + 4 + 2560;   // key query norm gated conv value gate emb
++
++static float* g_lstage = nullptr;
++static int64_t g_lcap = 0;
++static int g_lstride = 0;
++
++/// Allocate the snapshot's pinned host buffer.  Called OUTSIDE graph capture - cudaHostAlloc/cudaFreeHost
++/// synchronize, so doing either inside a capture leaves the capture poisoned.
++static bool layer_stage_ready(int64_t n_layers, int64_t stride) {
++    if (g_lstage != nullptr && g_lcap >= n_layers * stride) return true;
++    if (g_lstage) { cudaFreeHost(g_lstage); g_lstage = nullptr; g_lcap = 0; }
++    if (cudaHostAlloc((void**) &g_lstage, sizeof(float) * (size_t) (n_layers * stride),
++                      cudaHostAllocDefault) != cudaSuccess) { g_lstage = nullptr; g_lcap = 0; return false; }
++    g_lcap = n_layers * stride;
++    return true;
++}
++
+ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+     using namespace strata::kernels;
+     const ModelGeometry& g = *g_;
+@@ -337,6 +360,21 @@
+     const int G = (split_ && T >= 2) ? 2 : 1;
+     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
++    // Local patch: STRATA_DUMP_LAYERS2 snapshots, per layer and for the window's FIRST row, the residual
++    // entering the layer's mixer (R), the block output and both injections, into PINNED host memory so the
++    // copy is a legal graph node.  Written out by run()'s dump block; the token loop's --dump-layers is
++    // unreachable for a native pack, and this is the only per-layer view of a verify window.
++    const int lstride = g_lstride = (int) (HC * N + N + 2 * HC);
++    const bool ldump = g_lstage != nullptr && g_lcap >= (int64_t) g.n_layers * lstride;
++    auto lsnap = [&](int64_t l, int t) {
++        if (!ldump || g_lstage == nullptr || l < 0 || l >= g.n_layers) return;
++        float* lstage = g_lstage;
++        float* h = lstage + (size_t) l * lstride;
++        cudaMemcpyAsync(h, R_ + (size_t) t * HC * N, HC * N * sizeof(float), cudaMemcpyDeviceToHost, cs);
++        cudaMemcpyAsync(h + HC * N, bo_ + (size_t) t * N, N * sizeof(float), cudaMemcpyDeviceToHost, cs);
++        cudaMemcpyAsync(h + HC * N + N, inj_ + (size_t) t * HC, HC * sizeof(float), cudaMemcpyDeviceToHost, cs);
++        cudaMemcpyAsync(h + HC * N + N + HC, inj2_ + (size_t) t * HC, HC * sizeof(float), cudaMemcpyDeviceToHost, cs);
++    };
+     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+     groups_[T] = G;
+ 
+@@ -413,6 +451,17 @@
+                 po.result = Rt(t);
+                 try {
+                     ple_block(ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs);
++                    if (g_ple != nullptr && t == 0) {   // Local patch: key query norm gated conv value gate emb
++                        const float* b = (const float*) ss.ple.scratch;
++                        float* d = g_ple;
++                        for (int k = 0; k < 5; ++k)
++                            cudaMemcpyAsync(d + (size_t) k * 10240, b + (size_t) k * 10240, 10240 * sizeof(float),
++                                            cudaMemcpyDeviceToDevice, cs);
++                        cudaMemcpyAsync(d + 5 * 10240, b + 5 * 10240, 2560 * sizeof(float), cudaMemcpyDeviceToDevice, cs);
++                        cudaMemcpyAsync(d + 5 * 10240 + 2560, b + 5 * 10240 + 2560, 4 * sizeof(float),
++                                        cudaMemcpyDeviceToDevice, cs);
++                        cudaMemcpyAsync(d + 5 * 10240 + 2560 + 4, ple_, 2560 * sizeof(float), cudaMemcpyDeviceToDevice, cs);
++                    }
+                     ple_history_advance(ss.ple.hist, normalized, cs);
+                 } catch (const std::exception& e) {
+                     err = std::string("verify PLE: ") + e.what();
+@@ -437,6 +486,7 @@
+                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+         };
+         gr_read_group(0, pending, inj2_, inj_);
++        lsnap(l, tb);
+         stamp(l, 1, grp);
+         float* xm = mixed_ + tb * N;
+         try {
+@@ -943,6 +993,12 @@
+     const ModelGeometry& g = *g_;
+     SessionState& ss = *ss_;
+     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
++    if (std::getenv("STRATA_DUMP_LAYERS2") != nullptr)   // Local patch: before the capture, never inside it
++        layer_stage_ready(g.n_layers, g.hc * g.n_embd + g.n_embd + 2 * g.hc);
++    if (std::getenv("STRATA_DUMP_PLE") != nullptr && g_ple == nullptr) {
++        if (cudaMalloc(&g_ple, sizeof(float) * kPleDumpFloats) != cudaSuccess) g_ple = nullptr;
++        else g_ple_n = kPleDumpFloats;
++    }
+     if (!capture(T, err) || !capture_commit(err)) return false;
+     VDBG("captured; staging\n");
+     const Clock::time_point t0 = Clock::now();
+@@ -1080,6 +1136,86 @@
+         }
+     }
+     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
++    // Local patch: STRATA_DUMP_LOGITS=PATH appends every verify window's head logits to PATH as
++    // {int32 pos0, int32 T, int32 n_vocab} followed by T * n_vocab float32 rows (row t = logits after
++    // window row t).  The only way to see the target's logits at all: --dump-logits hooks the token loop
++    // and this engine never enters it (batched prefill + verify windows).
++    if (static const char* dpath = std::getenv("STRATA_DUMP_LOGITS"); dpath != nullptr && dpath[0] != '\0') {
++        static std::FILE* df = std::fopen(dpath, "wb");
++        if (df != nullptr) {
++            const int32_t hdr[3] = {(int32_t) pos0, (int32_t) T, (int32_t) n_vocab_};
++            std::fwrite(hdr, sizeof hdr, 1, df);
++            std::vector<float> h((size_t) T * (size_t) n_vocab_);
++            if (cudaMemcpy(h.data(), head_logits_, h.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(h.data(), sizeof(float), h.size(), df);
++            std::fflush(df);
++        }
++    }
++    // Local patch: STRATA_DUMP_HEAD=PATH appends, per verify window, {int32 pos0, T, n_vocab, hc, n_embd}
++    // followed by T*hc*n_embd floats of R (the last layer's residual, row-major (T, hc, n_embd)), T*n_embd
++    // floats of the head's `mixed` vector and T*n_vocab logits.  Enough to re-do the head outside the engine
++    // and tell a wrong residual from a wrong head.
++    if (static const char* ppath = std::getenv("STRATA_DUMP_PLE"); ppath != nullptr && ppath[0] != '\0') {
++        static std::FILE* pf = std::fopen(ppath, "wb");
++        if (pf != nullptr && g_ple != nullptr) {
++            std::vector<float> ph((size_t) g_ple_n);
++            if (cudaMemcpy(ph.data(), g_ple, ph.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(ph.data(), sizeof(float), ph.size(), pf);
++            std::fflush(pf);
++        }
++    }
++    if (static const char* lpath = std::getenv("STRATA_DUMP_LAYERS2"); lpath != nullptr && lpath[0] != '\0') {
++        static std::FILE* lf = std::fopen(lpath, "wb");
++        if (lf != nullptr && g_lstage != nullptr && g_lstride > 0) {
++            const int32_t lh[4] = {(int32_t) pos0, (int32_t) T, (int32_t) g.n_layers, g_lstride};
++            std::fwrite(lh, sizeof lh, 1, lf);
++            std::fwrite(g_lstage, sizeof(float), (size_t) g.n_layers * g_lstride, lf);
++            std::fflush(lf);
++        }
++    }
++    if (static const char* hpath = std::getenv("STRATA_DUMP_HEAD"); hpath != nullptr && hpath[0] != '\0') {
++        static std::FILE* hf = std::fopen(hpath, "wb");
++        if (hf != nullptr) {
++            const int64_t HC = g.hc, N = g.n_embd;
++            const int32_t hdr[5] = {(int32_t) pos0, (int32_t) T, (int32_t) n_vocab_, (int32_t) HC, (int32_t) N};
++            std::fwrite(hdr, sizeof hdr, 1, hf);
++            std::vector<float> hr((size_t) T * HC * N);
++            if (cudaMemcpy(hr.data(), R_, hr.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(hr.data(), sizeof(float), hr.size(), hf);
++            std::vector<float> hm((size_t) T * N);
++            if (cudaMemcpy(hm.data(), head_mixed_, hm.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(hm.data(), sizeof(float), hm.size(), hf);
++            std::vector<float> hl((size_t) T * n_vocab_);
++            if (cudaMemcpy(hl.data(), head_logits_, hl.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(hl.data(), sizeof(float), hl.size(), hf);
++            // the head mixer's workspace, as the LAST row left it: xn (hc*n_embd), lo (hc_lr), gated (hc*n_embd)
++            const auto GRW = ss.block.gr;
++            const int32_t wsh[4] {(int32_t) (HC * N), (int32_t) g.hc_lr, (int32_t) (HC * N), 0};
++            std::fwrite(wsh, sizeof wsh, 1, hf);
++            std::vector<float> w1((size_t) HC * N), w3((size_t) HC * N), w2((size_t) g.hc_lr);
++            if (cudaMemcpy(w1.data(), GRW.xn, w1.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(w1.data(), sizeof(float), w1.size(), hf);
++            if (cudaMemcpy(w2.data(), GRW.lo, w2.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(w2.data(), sizeof(float), w2.size(), hf);
++            if (cudaMemcpy(w3.data(), GRW.gated, w3.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess)
++                std::fwrite(w3.data(), sizeof(float), w3.size(), hf);
++            // the Q8_1 activations the native head consumed, and the first 4096 bytes of its weights
++            {
++                const size_t xb = (size_t) N / 32 * 36;
++                std::vector<uint8_t> xb_buf(xb);
++                if (cudaMemcpy(xb_buf.data(), xq_, xb, cudaMemcpyDeviceToHost) == cudaSuccess)
++                    std::fwrite(xb_buf.data(), 1, xb, hf);
++                if (head_ != nullptr && head_->loaded()) {
++                    std::fprintf(stderr, "head dump: type %d weights %p bytes %llu row_bytes %zu\n", head_->type(),
++                                 head_->weights(), (unsigned long long) head_->weight_bytes(), head_->row_bytes());
++                    std::vector<uint8_t> hb(4096);
++                    if (cudaMemcpy(hb.data(), head_->weights(), hb.size(), cudaMemcpyDeviceToHost) == cudaSuccess)
++                        std::fwrite(hb.data(), 1, hb.size(), hf);
++                }
++            }
++            std::fflush(hf);
++        }
++    }
+     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
+         static bool reported = false;
+         if (!reported) {
+
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4584,7 +4677,9 @@
+     // round emits (accepted drafts + 1) tokens.  `commit` keeps the state of the tokens that were emitted.
+     const bool ended = o.stop_eos && !produced.empty() &&
+                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
+-    if (spec_pos > 0 && (int64_t) produced.size() < o.max_new && !ended) {
++    // Local patch: a native pack with a one-token prompt sets spec_pos = 0 (the loop's own start), which the
++    // old `spec_pos > 0` guard read as "the spec loop is not used" and dropped the only window.  Let it run.
++    if ((spec_pos > 0 || (native_pack && n_prompt >= 1)) && (int64_t) produced.size() < o.max_new && !ended) {
+         std::vector<int64_t> oracle;
+         if (!o.spec_oracle.empty()) {
+             std::ifstream in(o.spec_oracle);

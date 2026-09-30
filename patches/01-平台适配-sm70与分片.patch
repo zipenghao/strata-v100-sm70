@@ -1,0 +1,257 @@
+# 平台适配：让 Strata 能在 sm_70（V100）上安装与编译，并正确发现多 GGUF 分片
+# 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+--- a/setup.py
++++ b/setup.py
+@@ -285,9 +285,10 @@
+ 
+ def gpu_problem(g, together=False):
+     """Why Strata cannot use this card, in plain words (None: it can)."""
+-    if int(g["arch"]) < 80:
+-        return (f"not supported - older than the RTX 30 series (compute capability {cc(g)}; Strata needs 8.0 or "
+-                "newer)")
++    # local patch: Volta (sm_70, Tesla V100) is accepted here too - every kernel has a pre-Ampere path and
++    # the engine compiles for sm_70 (the arch guard in CMakeLists.txt was lowered to 70 as well)
++    if int(g["arch"]) < 70:
++        return (f"not supported - too old (compute capability {cc(g)}; Strata needs 7.0 or newer)")
+     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
+         return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
+                 f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
+@@ -349,7 +350,7 @@
+         ones = " or ".join(f"--gpu {x['index']}" for x in single)
+         both = "--gpus " + ",".join(str(x["index"]) for x in can) if can else ""
+         hint = ((f"use these together: {both}" + (f" (or one card: {ones})" if not together else "")) if can else
+-                f"use one card: {ones}" if single else "Strata needs an NVIDIA RTX 30 series or newer card")
++                f"use one card: {ones}" if single else "Strata needs an NVIDIA GPU of compute capability 7.0 or newer")
+         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
+ 
+ 
+@@ -384,7 +385,7 @@
+     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
+     if not single:
+         gpu_table(found)
+-        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 30 series or newer (compute capability 8.0+)")
++        fail("none of your GPUs can run Strata", "it needs an NVIDIA GPU of compute capability 7.0 or newer")
+     can = together_ok(found)
+     if not can:
+         return [single[0]["index"]]
+@@ -1524,7 +1525,21 @@
+     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
+         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off")
+     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
+-    shards = [models_dir / fam["file"].format(q=model, i=i) for i in (1, 2)]
++    if a.gguf_dir:
++        # local patch: --gguf-dir holds the user's own files, whose names and shard count need not be
++        # Strata's ("<model>-00001-of-00002"): every shard beside the first one is used (the engine and
++        # tools/iq_pack.py discover them the same way, from the "-00001-of-" part of the name)
++        first = next(iter(sorted(models_dir.glob("*-00001-of-*.gguf"))), None) if models_dir.is_dir() else None
++        if first is None:
++            fail(f"no GGUF shard (*-00001-of-*.gguf) found in {models_dir}",
++                 "point --gguf-dir at the folder holding the model's split GGUF files")
++        m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first.name)
++        total = int(m.group(2)) if m else 1
++        shards = [first] if m is None else [
++            first.with_name(first.name[:m.start()] + f"-{i:05d}-of-{total:05d}.gguf") for i in range(1, total + 1)]
++        ok(f"model files: {len(shards)} shards in {models_dir}")
++    else:
++        shards = [models_dir / fam["file"].format(q=model, i=i) for i in (1, 2)]
+     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
+         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
+             cand = [r / "models" / tag / sh.name for sh in shards]
+@@ -1604,7 +1619,12 @@
+                  "--out", str(pack)], env=env)   # writes <pack>/tokenizer/
+     elif not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
+         # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
+-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack)], env=env)
++        # --compat-bf16: for an ordinary GGUF (not the GSQ-RCO files) the small projections the engine reads as
++        # BF16 are quantized, so they are dequantized to BF16 first; a file that does not need it retries plain
++        cmd = [sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack)]
++        if run([*cmd, "--compat-bf16"], env=env, check=False).returncode != 0:
++            say("  (retrying without --compat-bf16)")
++            run(cmd, env=env)
+     ok(f"model prepared: {pack}")
+     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
+     rt = mtp / "rt"
+@@ -1627,7 +1647,12 @@
+     ple = next((s for s in shards if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)
+     if ple is None:
+         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
+-    args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple),
++    # local patch: --native must be the shard holding token_embd/output (an unsloth split leaves shard 1
++    # metadata-only, so the engine would find no embedding there)
++    native = next((s for s in shards if any(t.name == "token_embd.weight" for t in GGUFFile(s).tensors)),
++                  shards[0])
++    ok(f"native shard (token embedding): {native.name}")
++    args = ["--pack", str(pack), "--native", str(native), "--ple-gguf", str(ple),
+             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
+             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+             "--max-context", str(ctx)]
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,9 +56,13 @@
+     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
+       continue()
+     endif()
+-    if(_base LESS 80 AND NOT STRATA_EXPERIMENTAL_SM75)   # the A/B of a Turing card as a layer-split stage
++    # Local patch: lowered from 80 to 70 so Volta (sm_70, Tesla V100) can be built.  Every kernel below has a
++    # pre-Ampere path (#if __CUDA_ARCH__ < 800 falls back to FP32 FMAs where tf32 mma / bf16 math is missing)
++    # and all 44 .cu sources compile for sm_70 with the CUDA 12.8 toolkit; this is untested hardware for the
++    # author, so treat the numbers as measured-here rather than published-here.
++    if(_base LESS 70)                             # the A/B of a Turing card as a layer-split stage
+       message(FATAL_ERROR
+-        "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
++        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer, but "
+         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
+     endif()
+   endforeach()
+
+--- a/tools/mtp_fetch.py
++++ b/tools/mtp_fetch.py
+@@ -19,7 +19,8 @@
+ import time
+ import urllib.request
+ 
+-REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
++# HF_ENDPOINT overrides the host (e.g. https://hf-mirror.com where huggingface.co is not reachable)
++REPO = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/") + "/Qwen/Qwen3.8-Flash-Next/resolve/main/"
+ DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
+ 
+ 
+
+--- a/src/core/device.cu
++++ b/src/core/device.cu
+@@ -30,7 +30,7 @@
+     int count = 0;
+     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
+     if (count == 0) {
+-        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU of compute capability 8.0 or newer", -1);
++        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU of compute capability 7.0 or newer", -1);
+     }
+     if (ordinal < 0 || ordinal >= count) {
+         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
+@@ -60,10 +60,12 @@
+     // arch guard in CMakeLists enforces at build time (RTX 30 / 40 / 50).  Anything older is caught here,
+     // because a binary can be carried to a machine with an older card and would otherwise silently take
+     // whatever path the driver chose.  Pre-Blackwell is untested by the author; trust, then verify.
+-    if (d.cc_major < 8) {
++    // Local patch: the floor is 7.0 here (Volta) rather than 8.0 - the pre-Ampere kernel paths are compiled in
++    // and the guard below still refuses Kepler/Pascal, whose arch the kernels were never written for.
++    if (d.cc_major < 7) {
+         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
+                             "." + std::to_string(d.cc_minor) +
+-                            "; Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50)",
++                            "; Strata needs an NVIDIA GPU of compute capability 7.0 or newer",
+                         -1);
+     }
+     return d;
+
+--- a/src/core/native_head.cpp
++++ b/src/core/native_head.cpp
+@@ -23,8 +23,16 @@
+     }
+     try {
+         strata::GgufFile gguf(path);
+-        err = strata::check_architecture(gguf);
+-        if (!err.empty()) return false;
++        // Local patch: a split sibling (unsloth's GGUFs) carries split.* but no general.architecture; the
++        // architecture was already validated on the shard that has it (native dense's first shard), so only
++        // guard here when the key is present.
++        if (gguf.get("general.architecture")) {
++            err = strata::check_architecture(gguf);
++            if (!err.empty()) return false;
++        } else if (!gguf.get("split.count") || !gguf.get("split.no")) {
++            err = "native head: missing general.architecture";
++            return false;
++        }
+         const strata::TensorInfo* tensor = nullptr;
+         for (const auto& candidate : gguf.tensors()) {
+             if (candidate.name != "output.weight") continue;
+
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -555,6 +555,26 @@
+         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
+     }
+ }
++// Local patch: Q6_K embedding rows (strata/dequant.hpp dequantize_q6_K, same ggml layout). 32 threads
++// cover the 256 values of one super-block: two 128-value halves, each four 32-value groups of 8 scales.
++template<typename dst_t>
++__device__ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
++    const block_q6_K* x = (const block_q6_K*) vx + ibs;
++    const float d = (float) x->d;
++    for (int i = tid; i < 256; i += 32) {
++        const int h = i >> 7, r = i & 127, k = r >> 5, l = r & 31, is = l >> 4;
++        const uint8_t* q = x->ql + 64 * h;
++        const uint8_t* qh = x->qh + 32 * h;
++        const int8_t* s = x->scales + 8 * h;
++        int lo, hi, si;
++        if (k == 0)      { lo = q[l] & 0xF;      hi = (qh[l] >> 0) & 3; si = is + 0; }
++        else if (k == 1) { lo = q[l + 32] & 0xF; hi = (qh[l] >> 2) & 3; si = is + 2; }
++        else if (k == 2) { lo = q[l] >> 4;       hi = (qh[l] >> 4) & 3; si = is + 4; }
++        else             { lo = q[l + 32] >> 4;  hi = (qh[l] >> 6) & 3; si = is + 6; }
++        yy[i] = cvt<dst_t>(d * (float) s[si] * (float) ((lo | (hi << 4)) - 32));
++    }
++}
++
+ template<typename dst_t>
+ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
+@@ -581,6 +601,7 @@
+         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+         case 11: dq_q3_k(vx, ibs, y, tid); break;
+         case 42: dq_q2_0(vx, ibs, y, tid); break;
++        case 14: dq_q6_k(vx, ibs, y, tid); break;   // local patch: Q6_K embedding rows
+         default: break;
+     }
+ }
+@@ -600,7 +621,10 @@
+     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
+ }
+ 
+-bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11; }
++bool is_iq(int t) {
++    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 ||
++           t == 11 || t == 14;   // local patch: 14 (Q6_K) embed rows
++}
+ 
+ }  // namespace
+ 
+@@ -618,6 +642,7 @@
+         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
+         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
++        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);   // local patch: Q6_K embedding rows
+         default: return 0;
+     }
+ }
+
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -432,12 +433,22 @@
+                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
+ }
+ 
+-/// All shards of a split GGUF, from shard 1's path ("...-00001-of-00002.gguf"); just the path when it is not split.
++/// All shards of a split GGUF, from any shard's path ("...-00002-of-00003.gguf"); just the path when it is not split.
+ std::vector<std::string> model_shards(const std::string& first) {
+-    const std::string tag = "-00001-of-";
+-    const size_t at = first.rfind(tag);
+-    if (at == std::string::npos || first.size() < at + tag.size() + 10) return {first};
+-    const int total = std::atoi(first.substr(at + tag.size(), 5).c_str());
++    // Local patch: also accept shard 2/3 as the starting path. A GGUF whose shard 1 holds only the metadata
++    // (unsloth's splits) has token_embd in a later shard, so --native points there.
++    const size_t of = first.rfind("-of-");
++    const size_t at = of == std::string::npos || of < 6 ? std::string::npos : of - 6;
++    auto digits = [](const std::string& s, size_t i) {
++        for (size_t k = i; k < i + 5; ++k)
++            if (s[k] < '0' || s[k] > '9') return false;
++        return true;
++    };
++    if (at == std::string::npos || first.size() < of + 14 || first[at] != '-' || !digits(first, at + 1) ||
++        !digits(first, of + 4))
++        return {first};
++    const int total = std::atoi(first.substr(of + 4, 5).c_str());
++    if (total <= 0) return {first};
+     std::vector<std::string> out;
+     for (int i = 1; i <= total && i <= 99; ++i) {
+         char num[8];

@@ -1,0 +1,10 @@
+# 编辑器 / 系统杂项
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# 若你把本机生成的运行日志放进本目录，不要提交
+*.log
+server.log
+strata-*.log

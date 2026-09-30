@@ -1,0 +1,40 @@
+# NOTICE
+
+## 本仓库是什么
+
+这是一个**第三方、非官方**的补丁与实践记录集合，用于让 [Strata](https://github.com/Niko1221/Strata)
+在 **Tesla V100（sm_70）** 等官方支持矩阵之外的 NVIDIA 卡上正确运行。
+
+- 本仓库**不是** Strata 官方发布物，也不代表 Strata 项目的立场。
+- 本仓库**不包含任何模型权重**。文档中出现的 GGUF 文件名仅为路径示例，权重需自行从
+  Hugging Face 或其他来源获取，并遵守其各自的许可。
+- 所有性能数字均为单机实测，配置见 README §1。
+
+## 上游项目与许可
+
+| 项目 | 许可 | 版权 |
+|---|---|---|
+| [Strata](https://github.com/Niko1221/Strata) v0.1.24 | MIT | Copyright (c) 2026 Niko1221 and the Strata contributors |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)（Strata 的 `third_party/`） | MIT | Copyright (c) 2023-2026 The ggml authors |
+
+`patches/` 下的四个补丁是对上述 MIT 项目的修改产物，其著作权归各原作者；
+本仓库依 MIT 许可分发这些补丁的副本。
+
+**MIT 许可要求保留原始版权与许可声明**：若你分发本仓库或其中的补丁，请一并保留
+本文件以及 Strata 源仓库中的 `LICENSE`。
+
+## 模型许可
+
+本仓库涉及的模型（Qwen3.8-Flash-Next 及其 GGUF 量化版本）**不在本仓库中分发**，
+其版权与许可归各发布方所有：
+
+- Qwen3.8-Flash-Next — Qwen 团队，遵循其官方仓库所载许可；
+- GSQ-RCO / UD 系列 GGUF 量化 — ISTA-DASLab、Unsloth 等发布者，遵循各自分发页所载许可；
+- Strata 仓库中的 `data/experimental-speed-projection` 控制向量为 Qwen Community License 1.0，
+  **本仓库不包含该文件**。
+
+使用模型前请自行确认所选版本的使用条款。
+
+## 商标
+
+"NVIDIA"、"Tesla"、"V100"、"CUDA" 等名称归其各自所有者所有，本仓库仅作兼容性说明用途。

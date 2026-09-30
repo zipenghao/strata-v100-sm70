@@ -1,0 +1,67 @@
+# 正确性修复：ple_conv1d.weight 在该 GGUF 中是 F32，按 fp16 位强转会使 PLE 卷积输出放大约 500 倍，从第 1 层起污染残差，输出为乱码
+# 用法：在 Strata-0.1.24 源码根目录执行  patch -p1 < 本文件
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -26,6 +26,7 @@
+ #include "strata/kernels/cpu/pool.hpp"
+ #include "strata/kernels/cpu/expert_layout.hpp"
+ #include "strata/kernels/ngram.hpp"
++#include "strata/kernels/f16_bits.hpp"
+ #include "strata/kernels/s2_expert_grouped.hpp"
+ #include "strata/kernels/sampler.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -1582,7 +1608,51 @@
+         ss.ple.w.norm_key = (const float*) wnk->data;
+         ss.ple.w.norm_query = (const float*) wnq->data;
+         ss.ple.w.norm_conv = (const float*) wnc->data;
+-        ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
++        // Local patch: `ple_conv1d.weight` is F32 in this artifact (Unsloth's GGUF: the pack holds it as
++        // kind F32, 4 B/elem), and the pinned PLE conv kernels - `conv_kernel` and
++        // `conv_residual_kernel` - take F16 BITS, exactly as `ple_parity` captured them.  Casting the F32
++        // bytes to `uint16_t*` therefore reads two garbage halves per weight: the PLE's conv output came
++        // out ~500x too large, the residual absorbed it at layer 1, and every later layer inherited a wrong
++        // residual while the head, the embedding and the hyper-connection mixer all verified bit-exact.
++        // Re-round ONCE here, which is also what the reference does with these values (llama.cpp multiplies
++        // by the F32 weights directly; fp16's 2^-11 is far below the conv's own contribution).
++        {
++            const uint64_t want = (uint64_t) strata::kernels::PLE_CONV_KERNEL * g.hc * g.n_embd;
++            if ((uint64_t) wc->ne0 * (uint64_t) wc->ne1 != want) {
++                std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is %lldx%lld, not %llu\n",
++                             (long long) wc->ne0, (long long) wc->ne1, (unsigned long long) want);
++                return 1;
++            }
++            if ((uint64_t) wc->bytes == want * 2) {
++                ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;          // already fp16 bits
++            } else if ((uint64_t) wc->bytes == want * 4 && wc->kind == strata::core::WeightKind::F32) {
++                static std::vector<float> host_f32;
++                static std::vector<uint16_t> host_f16;
++                host_f32.resize((size_t) want);
++                host_f16.resize((size_t) want);
++                // the pack's arena is DEVICE memory (see the "loaded ... MiB" line), so the values are read
++                // back before the conversion: dereferencing `wc->data` on the host faults.
++                if (cudaMemcpy(host_f32.data(), wc->data, host_f32.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
++                    std::fprintf(stderr, "strata generate: the PLE conv weight read-back failed\n");
++                    return 1;
++                }
++                for (size_t i = 0; i < host_f16.size(); ++i)
++                    host_f16[i] = strata::kernels::f16_from_f32(host_f32[i]);
++                void* dev = nullptr;
++                if (cudaMalloc(&dev, host_f16.size() * 2) != cudaSuccess) {
++                    std::fprintf(stderr, "strata generate: the PLE conv weight copy failed\n");
++                    return 1;
++                }
++                cudaMemcpy(dev, host_f16.data(), host_f16.size() * 2, cudaMemcpyHostToDevice);
++                ss.ple.w.conv1d_f16 = (const uint16_t*) dev;
++                std::fprintf(stderr, "strata generate: PLE conv1d re-rounded F32 -> fp16 (%llu taps)\n",
++                             (unsigned long long) want);
++            } else {
++                std::fprintf(stderr, "strata generate: blk.1.ple_conv1d.weight is %llu B, neither fp16 nor "
++                                     "fp32\n", (unsigned long long) wc->bytes);
++                return 1;
++            }
++        }
+         ss.ple.consts = strata::kernels::ple_artifact_consts();
+         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
+         ss.ple.table = &ple_table;
