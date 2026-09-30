@@ -426,5 +426,22 @@ grep -E "PLE conv1d re-rounded|expert arena|borrows|own buffers|layer split:" st
 | `验证清单.md` | 逐项可跑的验证步骤 |
 | `LICENSE` | 本仓库内容许可（MIT） |
 | `NOTICE` | 上游项目与第三方许可声明；本包不含模型权重 |
+| `issues/` | 已提交给上游 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的三份英文 issue 正文 |
 
 > 补丁集已验证：在**原始 v0.1.24 源码**上按序应用后，8 个受改文件与本机可运行工程**逐字节一致**。
+
+---
+
+## 10. 已提交上游的 issue
+
+本文档涉及的三个上游问题已提交给 [Niko1221/Strata](https://github.com/Niko1221/Strata)，
+正文存于本仓库 `issues/`：
+
+| Issue | 主题 | 对应补丁 | 类型 |
+|---|---|---|---|
+| [#303](https://github.com/Niko1221/Strata/issues/303) | `ple_conv1d.weight` 是 F32 却被按 fp16 位读取 → 输出乱码 | 02 | **bug**（与硬件无关） |
+| [#305](https://github.com/Niko1221/Strata/issues/305) | 支持 sm_70（V100 / T4）；附带 `--gguf-dir` 分片数写死的问题 | 01 | feature request |
+| [#306](https://github.com/Niko1221/Strata/issues/306) | 分卡时 prompt 借用/预留两处不一致；8GiB 竞技场钉住上限（WDDM workaround）误用于 Linux | 03 | bug / perf |
+
+> 上游若已修复，请以官方改动为准，本仓库的补丁仅供复现与参考。
+
