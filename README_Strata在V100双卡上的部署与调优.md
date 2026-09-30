@@ -18,7 +18,7 @@
 
 ## TL;DR（30 秒版）
 
-- **一句话**：Strata v0.1.24 官方只支持 RTX 30 系（sm_80+）。这里给出让它在 **双 Tesla V100（sm_70）+ 无 AVX-512 的老 Xeon** 上正确跑起来的全部改动，实测 **128K 上下文 decode 43.4 tok/s、prefill 865 tok/s @117K token**。
+- **一句话**：Strata v0.1.24 官方只支持 RTX 30 系（sm_80+）。这里给出让它在 **双 Tesla V100（sm_70）（PCIE，无nvlink）+ 无 AVX-512 的老 Xeon** 上正确跑起来的全部改动，实测 **128K 上下文 decode 43.4 tok/s、prefill 865 tok/s @117K token**。
 - ⚠️ **只想拿补丁的话，先看补丁 02。** 不打它会得到「**输出乱码但看起来一切正常**」：长度对、速度对、显存对、换 prompt 时 logits 也会变，只有内容是错的。官方自带的 parity 测试全绿也发现不了。
 - **该打哪个补丁**：
 
